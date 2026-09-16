@@ -35,8 +35,20 @@ if "%PYTHON%"=="" (
 
 echo Python bulundu: %PYTHON%
 echo.
+
+REM -- requirements.txt var mi? ZIP acikmadan calistirilmasin --
+if not exist "%~dp0requirements.txt" (
+    echo [HATA] requirements.txt bulunamadi!
+    echo.
+    echo ZIP dosyasini once bir klasore cikartin,
+    echo sonra o klasordeki start.bat'i calistirin.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo Bagimliliklar kuruluyor...
-%PYTHON% -m pip install -r requirements.txt -q
+%PYTHON% -m pip install -r "%~dp0requirements.txt" -q
 if errorlevel 1 (
     echo.
     echo [HATA] Bagimliliklar kurulamadi.
@@ -51,5 +63,5 @@ echo Tarayici otomatik acilacak: http://localhost:8502
 echo.
 echo Kapatmak icin bu pencereyi kapatin.
 echo.
-%PYTHON% -m streamlit run app.py --server.port 8502 --server.headless true
+%PYTHON% -m streamlit run "%~dp0app.py" --server.port 8502 --server.headless true
 pause
