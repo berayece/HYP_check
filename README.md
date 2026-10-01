@@ -9,11 +9,11 @@ A web-based tool to compare Hyperion `.dat` exports against SAP BW Excel backups
 - Upload Hyperion `.dat` file and BW Excel file directly in the browser
 - Auto-detects encoding (UTF-16), delimiter, and header rows
 - Normalises period names (Jan → 1), ICP None variants, and case differences before matching
-- Classifies discrepancies into 4 categories:
+- Compares absolute values — opposite signs with equal amounts count as matching
+- Classifies discrepancies into 3 categories:
   - 🟠 **HYP only** — row exists in Hyperion but not in BW
   - 🔵 **BW only** — row exists in BW but not in Hyperion
-  - 🟡 **Sign difference** — same absolute value, opposite sign
-  - 🔴 **Value mismatch** — actual numeric difference
+  - 🔴 **Value mismatch** — absolute amounts differ
 - Excludes zero-value rows from comparison
 - Filter results by Status, Scenario, Year, Period, Entity, Account, ICP, Custom columns
 - Click any discrepancy row to see all raw records from both sources side by side
