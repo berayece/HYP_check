@@ -37,6 +37,9 @@ JOIN_KEYS: list[tuple[str, str]] = [
 
 NUMERIC_MAP = [("Amount", "CUM_VALUE")]
 
+# Parameter-entry accounts — differences on these are not reported as discrepancies
+PARAM_ACCOUNTS_DEFAULT = ["N2172", "N2173"]
+
 MONTH_MAP = {
     "jan":"1","feb":"2","mar":"3","apr":"4","may":"5","jun":"6",
     "jul":"7","aug":"8","sep":"9","oct":"10","nov":"11","dec":"12",
@@ -362,7 +365,217 @@ def breakdown(result: pd.DataFrame, dim: str) -> pd.DataFrame:
     piv["Mutlak fark tutarı"] = t.groupby(dim)["Abs Difference"].sum()
     return piv.reset_index()
 
-def to_excel_bytes(df: pd.DataFrame, diag=None, full=None) -> bytes:
+def _tr_int(n) -> str:
+    return f"{int(n):,}".replace(",", ".")
+
+def _period_label(periods) -> str:
+    ps = sorted({str(p) for p in periods}, key=lambda v: int(v) if v.isdigit() else 99)
+    if not ps:
+        return "—"
+    names = [MONTH_NAMES.get(p, p) for p in ps]
+    nums = [int(p) for p in ps if p.isdigit()]
+    if len(nums) == len(ps) and nums == list(range(nums[0], nums[-1] + 1)) and len(ps) > 2:
+        return f"{names[0]} – {names[-1]} ({len(ps)} dönem)"
+    return ", ".join(names)
+
+def run_stats(hyp_norm: pd.DataFrame, bw_norm: pd.DataFrame) -> dict:
+    """Scope + amount control figures of the compared data (after all filters)."""
+    h = hyp_norm.assign(_amt=pd.to_numeric(hyp_norm.get("Amount"), errors="coerce"))
+    b = bw_norm.assign(_amt=pd.to_numeric(bw_norm.get("Amount_BW"), errors="coerce"))
+
+    def _vals(col):
+        return sorted(set(h[col].dropna().astype(str)) | set(b[col].dropna().astype(str))) if col in h and col in b else []
+
+    def _per(dim):
+        g = pd.DataFrame({
+            "HYP satır":   h.groupby(dim).size(),
+            "BW satır":    b.groupby(dim).size(),
+            "Σ|HYP|":      h.groupby(dim)["_amt"].apply(lambda x: x.abs().sum()),
+            "Σ|BW|":       b.groupby(dim)["_amt"].apply(lambda x: x.abs().sum()),
+        }).fillna(0)
+        g["Fark (Σ|HYP| − Σ|BW|)"] = g["Σ|HYP|"] - g["Σ|BW|"]
+        g[["HYP satır", "BW satır"]] = g[["HYP satır", "BW satır"]].astype(int)
+        return g.reset_index().rename(columns={"index": dim})
+
+    per_period = _per("Period").sort_values("Period", key=lambda c: pd.to_numeric(c, errors="coerce"))
+    per_period.insert(1, "Ay", per_period["Period"].map(lambda v: MONTH_NAMES.get(str(v), str(v))))
+    return {
+        "scenarios": _vals("Scenario"), "years": _vals("Year"), "periods": _vals("Period"),
+        "n_entity": len(_vals("Entity")), "n_account": len(_vals("Account")), "n_icp": len(_vals("ICP")),
+        "hyp_rows": len(h), "bw_rows": len(b),
+        "hyp_abs": float(h["_amt"].abs().sum()), "bw_abs": float(b["_amt"].abs().sum()),
+        "hyp_net": float(h["_amt"].sum()), "bw_net": float(b["_amt"].sum()),
+        "per_period": per_period,
+        "per_entity": _per("Entity").sort_values("Σ|HYP|", ascending=False),
+    }
+
+def _write_report_sheet(wb, full: pd.DataFrame, diag: dict, stats: dict, meta: dict):
+    """One-page reconciliation report — readable even (especially) when there are no differences."""
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.chart.label import DataLabelList
+
+    sm = report_summary(full, diag)
+    ws = wb.create_sheet("Rapor", 0)
+    ws.sheet_view.showGridLines = False
+    for col in "ABCDEFGH":
+        ws.column_dimensions[col].width = 17
+    ws.column_dimensions["A"].width = 30
+
+    fill = lambda c: PatternFill(fill_type="solid", fgColor=c.lstrip("#"))
+    thin = Side(style="thin", color="D9D8D3")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    muted = Font(color="6B6A65", size=10)
+    h2 = Font(bold=True, size=13, color="1F1F1D")
+
+    def section(row, title):
+        ws.cell(row, 1, title).font = h2
+        for c in range(1, 9):
+            ws.cell(row, c).border = Border(bottom=Side(style="medium", color="1F1F1D"))
+
+    def kv(row, col, label, value, fmt=None):
+        ws.cell(row, col, label).font = muted
+        v = ws.cell(row, col + 1, value)
+        v.font = Font(bold=True)
+        v.alignment = Alignment(horizontal="left")
+        if fmt:
+            v.number_format = fmt
+
+    # Title
+    ws["A1"] = "HYP – BW Mutabakat Raporu"
+    ws["A1"].font = Font(bold=True, size=20)
+    run_at = meta.get("run_at") or datetime.now()
+    ws["A2"] = f"Oluşturulma: {run_at:%d.%m.%Y %H:%M}"
+    ws["A2"].font = muted
+
+    # Banner
+    diffs = sm["total"] - sm[IDENTICAL]
+    ws.merge_cells("A4:H4")
+    ws.row_dimensions[4].height = 34
+    if diffs == 0:
+        ws["A4"] = "✅  FARK BULUNMADI — HYP ve BW verileri mutabık (mutlak değerle karşılaştırma)"
+        ws["A4"].fill, ws["A4"].font = fill("E3F4EC"), Font(bold=True, size=13, color="0E6B47")
+    else:
+        ws["A4"] = f"⚠️  {_tr_int(diffs)} FARK SATIRI BULUNDU — ayrıntı 'Farklar' sayfasında"
+        ws["A4"].fill, ws["A4"].font = fill("FBE3E3"), Font(bold=True, size=13, color="9B1C1C")
+    ws["A4"].alignment = Alignment(vertical="center", indent=1)
+
+    # Scope
+    section(6, "Kapsam")
+    kv(7, 1, "Senaryo", ", ".join(stats["scenarios"]) or "—")
+    kv(7, 5, "Yıl", ", ".join(stats["years"]) or "—")
+    kv(8, 1, "Dönem", _period_label(stats["periods"]))
+    kv(8, 5, "Entity sayısı", stats["n_entity"], "#,##0")
+    kv(9, 1, "Hesap sayısı", stats["n_account"], "#,##0")
+    kv(9, 5, "ICP değer sayısı", stats["n_icp"], "#,##0")
+    kv(10, 1, "HYP dosyası", meta.get("hyp_file", "—"))
+    kv(11, 1, "BW dosyası", meta.get("bw_file", "—"))
+
+    # KPI tiles (mirrors the on-screen report)
+    section(13, "Sonuç")
+    tiles = [(lbl, sm[k], c) for k, lbl, c in REPORT_CATS]
+    for i, (lbl, n, colour) in enumerate(tiles):
+        c0 = 1 + i * 2
+        for r in (14, 15, 16):
+            ws.merge_cells(start_row=r, start_column=c0, end_row=r, end_column=c0 + 1)
+        head = ws.cell(14, c0, lbl)
+        head.fill, head.font = fill(colour), Font(bold=True, color="FFFFFF", size=11)
+        head.alignment = Alignment(horizontal="center")
+        val = ws.cell(15, c0, n)
+        val.font, val.number_format = Font(bold=True, size=22), "#,##0"
+        val.alignment = Alignment(horizontal="center")
+        pct = ws.cell(16, c0, n / sm["total"] if sm["total"] else 0)
+        pct.font, pct.number_format = muted, "0.0%"
+        pct.alignment = Alignment(horizontal="center")
+        for r in (14, 15, 16):
+            for c in (c0, c0 + 1):
+                ws.cell(r, c).border = box
+    ws.row_dimensions[15].height = 34
+
+    # Composition chart (data in hidden helper columns)
+    ws["K14"] = "Durum"
+    for i, (lbl, n, _) in enumerate(tiles):
+        ws.cell(14, 12 + i, lbl)
+        ws.cell(15, 12 + i, n)
+    ws["K15"] = "Satır"
+    for col in "KLMNO":
+        ws.column_dimensions[col].hidden = True
+    ch = BarChart()
+    ch.type, ch.grouping, ch.overlap = "bar", "percentStacked", 100
+    ch.add_data(Reference(ws, min_col=12, max_col=11 + len(tiles), min_row=14, max_row=15), titles_from_data=True)
+    ch.set_categories(Reference(ws, min_col=11, min_row=15))
+    for ser, (_, _, colour) in zip(ch.series, tiles):
+        ser.graphicalProperties.solidFill = colour.lstrip("#")
+        ser.graphicalProperties.line.solidFill = "FFFFFF"
+    ch.legend.position = "t"
+    ch.y_axis.number_format = "0%"
+    ch.y_axis.majorGridlines = None
+    ch.x_axis.delete = True
+    ch.height, ch.width = 3.6, 24
+    ws.add_chart(ch, "A18")
+
+    # Data preparation
+    section(26, "Veri hazırlığı")
+    for c, t in enumerate(["Adım", "HYP", "BW"], start=1):
+        x = ws.cell(27, c, t)
+        x.font, x.fill = Font(bold=True), fill("E9E8E4")
+    prep = [
+        ("Dosyadan okunan satır", meta.get("hyp_loaded"), meta.get("bw_loaded")),
+        ("Sıfır / boş tutar silinen", meta.get("hyp_zero"), meta.get("bw_zero")),
+        ("CURTYPE filtresi dışı", None, meta.get("curtype_excluded")),
+        ("Custom1/2/4 filtresi dışı", meta.get("custom_excl_hyp"), meta.get("custom_excl_bw")),
+        ("Karşılaştırılan satır", stats["hyp_rows"], stats["bw_rows"]),
+    ]
+    for i, (lbl, hv, bv) in enumerate(prep, start=28):
+        ws.cell(i, 1, lbl)
+        for c, v in ((2, hv), (3, bv)):
+            cell = ws.cell(i, c, v if v is not None else "—")
+            cell.number_format = "#,##0"
+            cell.alignment = Alignment(horizontal="right")
+    for c in (1, 2, 3):
+        ws.cell(32, c).font = Font(bold=True)
+
+    # Amount control
+    section(34, "Tutar kontrolü")
+    amt_cols = [(2, "HYP"), (4, "BW"), (6, "Fark (HYP − BW)")]   # each value spans two columns
+    ws.cell(35, 1).fill = fill("E9E8E4")
+    for c, t in amt_cols:
+        ws.merge_cells(start_row=35, start_column=c, end_row=35, end_column=c + 1)
+        x = ws.cell(35, c, t)
+        x.font, x.fill, x.alignment = Font(bold=True), fill("E9E8E4"), Alignment(horizontal="right")
+    for r, (lbl, hv, bv) in enumerate([("Mutlak toplam  Σ|tutar|", stats["hyp_abs"], stats["bw_abs"]),
+                                        ("Net toplam  Σ tutar", stats["hyp_net"], stats["bw_net"])], start=36):
+        ws.cell(r, 1, lbl)
+        for (c, _), v in zip(amt_cols, (hv, bv, hv - bv)):
+            ws.merge_cells(start_row=r, start_column=c, end_row=r, end_column=c + 1)
+            ws.cell(r, c, v).number_format = "#,##0.00"
+    expl = "Net toplamlar arasındaki fark ters işaretli satırlardan kaynaklanır; mutabakat mutlak değer üzerinden yapılır."
+    if diag.get("param_excluded"):
+        expl += " Mutlak toplam farkı, sorun sayılmayan parametre hesaplarından gelebilir."
+    ws.cell(38, 1, expl).font = muted
+
+    # Notes
+    section(40, "Notlar")
+    notes = [
+        "Karşılaştırma mutlak değerle yapılır; tutarı aynı, işareti ters satırlar eşleşiyor sayılır "
+        f"(bu çalıştırmada {_tr_int(sm['sign_flipped'])} satır).",
+        "Eşleştirme anahtarı: Senaryo, Yıl, Dönem, Entity, Hesap, ICP, Custom1–4.",
+        "Tolerans: 0,0001 (çok büyük tutarlarda göreli 10⁻¹²).",
+    ]
+    if meta.get("curtype_selected") is not None:
+        notes.append(f"BW CURTYPE dahil edilen değerler: {', '.join(meta['curtype_selected']) or '—'}.")
+    if diag.get("param_accounts"):
+        notes.append(f"Parametre hesapları ({', '.join(diag['param_accounts'])}): "
+                     f"{_tr_int(diag.get('param_excluded', 0))} fark satırı sorun sayılmadı.")
+    for i, n in enumerate(notes, start=41):
+        ws.cell(i, 1, f"•  {n}")
+
+    ws.print_area = "A1:H" + str(41 + len(notes))
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+def to_excel_bytes(df: pd.DataFrame, diag=None, full=None, stats=None, meta=None) -> bytes:
     """Detail sheet = df (filtered); summary/breakdown sheets = full result."""
     full = df if full is None else full
     from openpyxl.styles import PatternFill, Font, Alignment
@@ -388,35 +601,16 @@ def to_excel_bytes(df: pd.DataFrame, diag=None, full=None) -> bytes:
 
     num_cols = {"HYP_Amount", "BW_CUM_VALUE", "Difference (|HYP|-|BW|)", "Abs Difference", "Mutlak fark tutarı"}
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # Summary sheet
+        # Report sheet + scope sheets
         if diag is not None:
-            sm = report_summary(full, diag)
-            rows = [(lbl, sm[k], sm[k] / sm["total"] if sm["total"] else 0) for k, lbl, _ in REPORT_CATS]
-            summ = pd.DataFrame(rows, columns=["Durum", "Satır sayısı", "Oran"])
-            summ.to_excel(writer, sheet_name="Özet", index=False, startrow=3)
-            ws = writer.sheets["Özet"]
-            ws["A1"] = "HYP vs BW karşılaştırma raporu"
-            ws["A1"].font = Font(bold=True, size=14)
-            ws["A2"] = f"Oluşturulma: {datetime.now():%d.%m.%Y %H:%M} · Karşılaştırılan anahtar: {sm['total']:,}"
-            for cell in ws[4]:
-                cell.font, cell.fill = bold, head_fill
-            for r in range(5, 5 + len(rows)):
-                ws.cell(r, 2).number_format = "#,##0"
-                ws.cell(r, 3).number_format = "0.0%"
-            hues = {lbl: c.lstrip("#") for _, lbl, c in REPORT_CATS}
-            for r in range(5, 5 + len(rows)):
-                ws.cell(r, 1).fill = PatternFill(fill_type="solid", fgColor=hues[ws.cell(r, 1).value])
-                ws.cell(r, 1).font = Font(bold=True, color="FFFFFF")
-            ws.column_dimensions["A"].width = 22
-            ws.column_dimensions["B"].width = 16
-            ws.column_dimensions["C"].width = 10
-            ws.cell(5 + len(rows) + 1, 1, "Tutar farkı (mutlak toplam)").font = bold
-            ws.cell(5 + len(rows) + 1, 2, sm["val_abs"]).number_format = "#,##0.00"
-            ws.cell(5 + len(rows) + 2, 1, "Ters işaretli, eşleşen").font = bold
-            ws.cell(5 + len(rows) + 2, 2, sm["sign_flipped"]).number_format = "#,##0"
-            ws.cell(5 + len(rows) + 3, 1, "Not: karşılaştırma mutlak değerle yapılır; ters işaret fark sayılmaz.")
+            if stats is not None:
+                _write_report_sheet(writer.book, full, diag, stats, meta or {})
+                for key, sheet in (("per_period", "Dönem özeti"), ("per_entity", "Entity özeti")):
+                    stats[key].to_excel(writer, sheet_name=sheet, index=False)
+                    _fmt(writer.sheets[sheet], stats[key], {"Σ|HYP|", "Σ|BW|", "Fark (Σ|HYP| − Σ|BW|)"})
 
-            for dim, sheet in (("Entity", "Entity"), ("Account", "Hesap"), ("Period", "Dönem"), ("Custom4", "Custom4")):
+            for dim, sheet in (("Entity", "Fark-Entity"), ("Account", "Fark-Hesap"),
+                               ("Period", "Fark-Dönem"), ("Custom4", "Fark-Custom4")):
                 b = breakdown(full, dim)
                 if b.empty:
                     continue
@@ -428,16 +622,18 @@ def to_excel_bytes(df: pd.DataFrame, diag=None, full=None) -> bytes:
                 _fmt(writer.sheets[sheet], b, num_cols)
 
         # Detail sheet — status colour via conditional formatting (fast on large files)
-        df.to_excel(writer, sheet_name="Farklar", index=False)
-        ws = writer.sheets["Farklar"]
-        _fmt(ws, df, num_cols)
-        if "Status" in df.columns and len(df):
-            col = get_column_letter(list(df.columns).index("Status") + 1)
-            rng = f"A2:{get_column_letter(len(df.columns))}{len(df) + 1}"
-            for status, colour in STATUS_COLORS.items():
-                ws.conditional_formatting.add(rng, FormulaRule(
-                    formula=[f'${col}2="{status}"'],
-                    fill=PatternFill(fill_type="solid", fgColor=colour.lstrip("#"), bgColor=colour.lstrip("#"))))
+        # (no differences → no empty detail sheet; the report sheet says so)
+        if not (df.empty and diag is not None and stats is not None):
+            df.to_excel(writer, sheet_name="Farklar", index=False)
+            ws = writer.sheets["Farklar"]
+            _fmt(ws, df, num_cols)
+            if "Status" in df.columns and len(df):
+                col = get_column_letter(list(df.columns).index("Status") + 1)
+                rng = f"A2:{get_column_letter(len(df.columns))}{len(df) + 1}"
+                for status, colour in STATUS_COLORS.items():
+                    ws.conditional_formatting.add(rng, FormulaRule(
+                        formula=[f'${col}2="{status}"'],
+                        fill=PatternFill(fill_type="solid", fgColor=colour.lstrip("#"), bgColor=colour.lstrip("#"))))
     return buf.getvalue()
 
 def _stacked_bar(data: pd.DataFrame, dim: str, horizontal: bool = True, sort=None):
@@ -459,7 +655,7 @@ def _stacked_bar(data: pd.DataFrame, dim: str, horizontal: bool = True, sort=Non
     return (alt.Chart(long).mark_bar(cornerRadiusEnd=3, stroke="white", strokeWidth=1)
             .encode(color=colour, order=order, tooltip=tip, **enc))
 
-def render_report(result: pd.DataFrame, diag: dict):
+def render_report(result: pd.DataFrame, diag: dict, stats=None):
     import altair as alt
     sm = report_summary(result, diag)
     total = sm["total"] or 1
@@ -469,6 +665,11 @@ def render_report(result: pd.DataFrame, diag: dict):
     money = lambda n: f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     st.header("📊 Karşılaştırma raporu")
+    if stats:
+        st.markdown(
+            f"**Senaryo** {', '.join(stats['scenarios']) or '—'} · **Yıl** {', '.join(stats['years']) or '—'} · "
+            f"**Dönem** {_period_label(stats['periods'])} · **{fmt(stats['n_entity'])}** entity · "
+            f"**{fmt(stats['n_account'])}** hesap · HYP **{fmt(stats['hyp_rows'])}** / BW **{fmt(stats['bw_rows'])}** satır")
 
     # ── Headline ───────────────────────────────
     diffs = total - sm[IDENTICAL]
@@ -488,15 +689,24 @@ def render_report(result: pd.DataFrame, diag: dict):
     # ── KPI tiles ──────────────────────────────
     k = st.columns(4)
     flip = sm["sign_flipped"]
-    k[0].metric("✅ Eşleşiyor", fmt(sm[IDENTICAL]), pct(sm[IDENTICAL]), delta_color="off",
-                help="Anahtar iki dosyada da var ve mutlak tutarlar aynı. "
-                     f"Bunların {fmt(flip)} tanesi ters işaretli (örn. HYP −100, BW +100) — sorun sayılmaz.")
-    k[1].metric("🔴 Tutar farkı", fmt(sm["Value mismatch"]), f"Σ|fark| {money(sm['val_abs'])}", delta_color="off",
-                help="Anahtar iki tarafta da var ama mutlak tutarlar farklı")
-    k[2].metric("🔵 Sadece BW", fmt(sm["BW only — not in HYP"]), pct(sm["BW only — not in HYP"]), delta_color="off",
-                help="BW'de olup HYP'de olmayan satırlar")
-    k[3].metric("🟠 Sadece HYP", fmt(sm["HYP only — not in BW"]), pct(sm["HYP only — not in BW"]), delta_color="off",
-                help="HYP'de olup BW'de olmayan satırlar")
+    tiles = [
+        ("✅ Eşleşiyor", sm[IDENTICAL], pct(sm[IDENTICAL]),
+         "Anahtar iki dosyada da var ve mutlak tutarlar aynı. "
+         f"Bunların {fmt(flip)} tanesi ters işaretli (örn. HYP −100, BW +100) — sorun sayılmaz."),
+        ("🔴 Tutar farkı", sm["Value mismatch"], f"Σ|fark| {money(sm['val_abs'])}",
+         "Anahtar iki tarafta da var ama mutlak tutarlar farklı"),
+        ("🔵 Sadece BW", sm["BW only — not in HYP"], pct(sm["BW only — not in HYP"]),
+         "BW'de olup HYP'de olmayan satırlar"),
+        ("🟠 Sadece HYP", sm["HYP only — not in BW"], pct(sm["HYP only — not in BW"]),
+         "HYP'de olup BW'de olmayan satırlar"),
+    ]
+    for col, (label, n, sub, tip) in zip(k, tiles):
+        with col.container(border=True):
+            st.metric(label, fmt(n), help=tip)
+            st.caption(sub)
+    if diag.get("param_excluded"):
+        st.caption(f"ℹ️ Parametre hesaplarındaki ({', '.join(diag['param_accounts'])}) "
+                   f"{fmt(diag['param_excluded'])} fark satırı sorun sayılmadı ve rapora dahil edilmedi.")
     if flip:
         st.caption(f"ℹ️ Karşılaştırma mutlak değerle yapılır. {fmt(flip)} satırda işaret ters ama tutar aynı; "
                    "bunlar eşleşiyor sayıldı.")
@@ -687,10 +897,35 @@ if hyp_df is not None and bw_df is not None:
         if excluded_custom_bw or excluded_custom_hyp:
             st.caption(f"⛔ Filtre sonrası dışarıda kalan satırlar — BW: {excluded_custom_bw:,}, HYP: {excluded_custom_hyp:,}")
 
+    acc_opts = sorted(set(hyp_df_filtered.get("Account", pd.Series(dtype=str)).dropna().astype(str).str.strip().str.upper())
+                      | set(bw_df_filtered.get("/BIC/ACCOUNTBI", pd.Series(dtype=str)).dropna().astype(str).str.strip().str.upper())
+                      | set(PARAM_ACCOUNTS_DEFAULT))
+    st.subheader("🧮 Parametre hesapları")
+    param_accounts = st.multiselect(
+        "Bu hesaplardaki farklar sorun olarak sayılmaz (parametre girişi)",
+        options=acc_opts, default=PARAM_ACCOUNTS_DEFAULT, key="param_accounts",
+    )
+
     st.divider()
     if st.button("▶️ Run Comparison", type="primary", use_container_width=True):
         with st.spinner("Comparing…"):
             result, diag, hyp_norm, bw_norm = compare(hyp_df_filtered, bw_df_filtered)
+            if not result.empty and param_accounts:
+                is_param = result["Account"].isin([a.upper() for a in param_accounts])
+                diag["param_excluded"] = int(is_param.sum())
+                diag["param_accounts"] = list(param_accounts)
+                result = result[~is_param].reset_index(drop=True)
+            g = globals()
+            meta = {
+                "run_at": datetime.now(), "hyp_file": dat_file.name, "bw_file": bw_file.name,
+                "hyp_loaded": len(hyp_df) + hyp_zero, "hyp_zero": hyp_zero,
+                "bw_loaded": len(bw_df) + bw_zero, "bw_zero": bw_zero,
+                "curtype_excluded": g.get("excluded"), "curtype_selected": g.get("selected_curtypes"),
+                "custom_excl_hyp": g.get("excluded_custom_hyp"), "custom_excl_bw": g.get("excluded_custom_bw"),
+            }
+            stats = run_stats(hyp_norm, bw_norm)
+        st.session_state["run_meta"]  = meta
+        st.session_state["run_stats"] = stats
         st.session_state["result"]   = result
         st.session_state["diag"]     = diag
         st.session_state["hyp_norm"] = hyp_norm   # normalised HYP for drill-down
@@ -703,7 +938,7 @@ if hyp_df is not None and bw_df is not None:
         result = st.session_state["result"]
         diag   = st.session_state["diag"]
 
-        render_report(result, diag)
+        render_report(result, diag, st.session_state.get("run_stats"))
 
         with st.expander("🔬 Teknik detay — anahtar sütun eşleşmeleri"):
             # ── Diagnostics ──────────────────────────────────────────
@@ -911,28 +1146,32 @@ if hyp_df is not None and bw_df is not None:
                         st.dataframe(bw_detail, use_container_width=True, height=300)
                         st.metric("BW CUM_VALUE Toplamı", f"{pd.to_numeric(bw_detail.get('CUM_VALUE', pd.Series(dtype=float)), errors='coerce').sum():,.4f}")
 
-            # ── Export ───────────────────────────────────────────
-            st.divider()
-            # Building the workbook takes a while on large results — only on request
-            sig = (len(result), len(filtered), float(filtered["Abs Difference"].sum()))
-            if st.session_state.get("excel_sig") != sig:
-                st.session_state.pop("excel_bytes", None)
-            if "excel_bytes" not in st.session_state:
-                if st.button("📄 Excel raporunu hazırla (özet + kırılımlar + filtrelenmiş farklar)",
-                             use_container_width=True):
-                    with st.spinner("Excel raporu hazırlanıyor… (büyük sonuçlarda ~30 sn)"):
-                        st.session_state["excel_bytes"] = to_excel_bytes(filtered, diag, full=result)
-                        st.session_state["excel_sig"] = sig
-                    st.rerun()
-            else:
-                st.download_button(
-                    label="⬇️  Excel raporunu indir",
-                    data=st.session_state["excel_bytes"],
-                    file_name=f"HYP_BW_rapor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=True,
-                )
+        # ── Export (always available — also when there are no differences) ──
+        st.divider()
+        filtered_x = filtered if not result.empty else result
+        sig = (len(result), len(filtered_x), float(filtered_x["Abs Difference"].sum()) if len(filtered_x) else 0.0,
+               id(st.session_state.get("run_stats")))
+        if st.session_state.get("excel_sig") != sig:
+            st.session_state.pop("excel_bytes", None)
+        if "excel_bytes" not in st.session_state:
+            if st.button("📄 Excel mutabakat raporunu hazırla", use_container_width=True,
+                         help="Rapor sayfası (kapsam, sonuç, veri hazırlığı, tutar kontrolü), dönem/entity özeti"
+                              " ve varsa farkların dökümü"):
+                with st.spinner("Excel raporu hazırlanıyor…"):
+                    st.session_state["excel_bytes"] = to_excel_bytes(
+                        filtered_x, diag, full=result,
+                        stats=st.session_state.get("run_stats"), meta=st.session_state.get("run_meta"))
+                    st.session_state["excel_sig"] = sig
+                st.rerun()
+        else:
+            st.download_button(
+                label="⬇️  Excel mutabakat raporunu indir",
+                data=st.session_state["excel_bytes"],
+                file_name=f"HYP_BW_mutabakat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
 
 else:
     st.info("👆 Upload both files above to start the comparison.")
