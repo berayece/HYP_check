@@ -136,16 +136,21 @@ def compare(hyp: pd.DataFrame, bw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         hyp_vals = set(hyp_c[h_col].dropna().unique())
         bw_vals  = set(bw_c[b_col].dropna().unique())
         overlap  = hyp_vals & bw_vals
+        only_hyp = hyp_vals - bw_vals
+        only_bw  = bw_vals  - hyp_vals
         diag["key_overlaps"][h_col] = {
             "hyp_unique": len(hyp_vals),
             "bw_unique":  len(bw_vals),
             "overlap":    len(overlap),
+            "only_hyp":   sorted(only_hyp),
+            "only_bw":    sorted(only_bw),
             "sample_hyp": sorted(hyp_vals)[:5],
             "sample_bw":  sorted(bw_vals)[:5],
         }
 
     bw_c = bw_c.rename(columns={b: h for h, b in JOIN_KEYS})
     bw_c = bw_c.rename(columns={b: f"{h}_BW" for h, b in NUMERIC_MAP})
+    bw_full = bw_c.copy()  # keep all original BW columns (CURBI, CURTYPE, MTD_VALUE, ICPFLAG…) for drill-down
     bw_keep = hyp_keys + [f"{h}_BW" for h, _ in NUMERIC_MAP]
     bw_c = bw_c[[c for c in bw_keep if c in bw_c.columns]]
 
@@ -191,7 +196,7 @@ def compare(hyp: pd.DataFrame, bw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         results.append(sub)
 
     result = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    return result, diag, hyp_c, bw_c
+    return result, diag, hyp_c, bw_full
 
 # ──────────────────────────────────────────────
 # EXCEL EXPORT
@@ -248,10 +253,59 @@ if dat_file and bw_file:
         with st.expander("Preview BW data"):
             st.dataframe(bw_df.head(10), use_container_width=True)
 
+    bw_df_filtered = bw_df
+    curtype_col = "/BIC/CURTYPE"
+    if curtype_col in bw_df.columns:
+        curtype_vals = sorted(bw_df[curtype_col].dropna().astype(str).str.strip().unique().tolist())
+        default_vals = [v for v in curtype_vals if v != "?"]
+        st.subheader("🧮 BW CURTYPE filtresi")
+        selected_curtypes = st.multiselect(
+            "Analize dahil edilecek /BIC/CURTYPE değerleri ('?' varsayılan olarak dışarıda bırakılır)",
+            options=curtype_vals,
+            default=default_vals,
+        )
+        bw_df_filtered = bw_df[bw_df[curtype_col].astype(str).str.strip().isin(selected_curtypes)].reset_index(drop=True)
+        excluded = len(bw_df) - len(bw_df_filtered)
+        if excluded:
+            st.caption(f"⛔ {excluded:,} BW satırı ({', '.join(sorted(set(curtype_vals) - set(selected_curtypes))) or '—'}) analiz dışında bırakıldı.")
+
+    hyp_df_filtered = hyp_df
+    custom_filter_cols = [
+        ("/BIC/CUSTOM1BI", "Custom1"),
+        ("/BIC/CUSTOM2BI", "Custom2"),
+        ("/BIC/CUSTOM4BI", "Custom4"),
+    ]
+    present_custom_cols = [(c, l) for c, l in custom_filter_cols
+                            if c in bw_df_filtered.columns and l in hyp_df_filtered.columns]
+    if present_custom_cols:
+        st.subheader("🧮 Custom1 / Custom2 / Custom4 filtresi (BW + HYP)")
+        st.caption("Bu sütunlar eşleştirme anahtarı olduğu için seçim hem BW hem HYP verisine birlikte uygulanır.")
+        before_custom_bw  = len(bw_df_filtered)
+        before_custom_hyp = len(hyp_df_filtered)
+        ui_cols = st.columns(len(present_custom_cols))
+        for (col_name, label), ui_col in zip(present_custom_cols, ui_cols):
+            with ui_col:
+                bw_vals  = bw_df_filtered[col_name].dropna().astype(str).str.strip().unique().tolist()
+                hyp_vals = hyp_df_filtered[label].dropna().astype(str).str.strip().unique().tolist()
+                raw_vals = sorted(set(bw_vals) | set(hyp_vals))
+                default_vals = [v for v in raw_vals if _NONE_RE.match(v)]
+                selected_vals = st.multiselect(
+                    f"{label} — sadece NONE varsayılan",
+                    options=raw_vals,
+                    default=default_vals,
+                    key=f"filt_{col_name}",
+                )
+                bw_df_filtered  = bw_df_filtered[bw_df_filtered[col_name].astype(str).str.strip().isin(selected_vals)].reset_index(drop=True)
+                hyp_df_filtered = hyp_df_filtered[hyp_df_filtered[label].astype(str).str.strip().isin(selected_vals)].reset_index(drop=True)
+        excluded_custom_bw  = before_custom_bw  - len(bw_df_filtered)
+        excluded_custom_hyp = before_custom_hyp - len(hyp_df_filtered)
+        if excluded_custom_bw or excluded_custom_hyp:
+            st.caption(f"⛔ Filtre sonrası dışarıda kalan satırlar — BW: {excluded_custom_bw:,}, HYP: {excluded_custom_hyp:,}")
+
     st.divider()
     if st.button("▶️ Run Comparison", type="primary", use_container_width=True):
         with st.spinner("Comparing…"):
-            result, diag, hyp_norm, bw_norm = compare(hyp_df, bw_df)
+            result, diag, hyp_norm, bw_norm = compare(hyp_df_filtered, bw_df_filtered)
         st.session_state["result"]   = result
         st.session_state["diag"]     = diag
         st.session_state["hyp_norm"] = hyp_norm   # normalised HYP for drill-down
@@ -279,6 +333,8 @@ if dat_file and bw_file:
                     "HYP unique vals":  info["hyp_unique"],
                     "BW unique vals":   info["bw_unique"],
                     "Overlapping vals": info["overlap"],
+                    "Only HYP":        len(info.get("only_hyp", [])),
+                    "Only BW":         len(info.get("only_bw",  [])),
                     "HYP samples": ", ".join(str(x) for x in info["sample_hyp"]),
                     "BW samples":  ", ".join(str(x) for x in info["sample_bw"]),
                 })
@@ -293,6 +349,34 @@ if dat_file and bw_file:
             zero_overlap = [r["Join Key (HYP)"] for r in diag_rows if r["Overlapping vals"] == 0]
             if zero_overlap:
                 st.warning(f"⚠️ No overlapping values in: **{', '.join(zero_overlap)}** — rows on these keys will never match.")
+
+            # ── Unique value breakdown per key ───────────────────
+            with st.expander("📋 Tekil değer detayı — yalnızca HYP / yalnızca BW"):
+                for key, info in diag["key_overlaps"].items():
+                    only_hyp_list = info.get("only_hyp", [])
+                    only_bw_list  = info.get("only_bw",  [])
+                    if not only_hyp_list and not only_bw_list:
+                        continue
+                    st.markdown(f"#### {key}")
+                    uc1, uc2 = st.columns(2)
+                    with uc1:
+                        st.markdown(f"**🟠 Yalnızca HYP — {len(only_hyp_list):,} değer**")
+                        if only_hyp_list:
+                            st.dataframe(
+                                pd.DataFrame({"HYP only": only_hyp_list}),
+                                use_container_width=True, height=220,
+                            )
+                        else:
+                            st.info("Fark yok")
+                    with uc2:
+                        st.markdown(f"**🔵 Yalnızca BW — {len(only_bw_list):,} değer**")
+                        if only_bw_list:
+                            st.dataframe(
+                                pd.DataFrame({"BW only": only_bw_list}),
+                                use_container_width=True, height=220,
+                            )
+                        else:
+                            st.info("Fark yok")
 
         mc = diag.get("matched_rows", 0)
         ho = diag.get("hyp_only_rows", 0)
@@ -463,10 +547,7 @@ if dat_file and bw_file:
                     if bw_detail.empty:
                         st.info("Bu anahtara ait BW verisi yok.")
                     else:
-                        bw_show_cols = [b for _, b in JOIN_KEYS if b in bw_detail.columns] + \
-                                       [b for _, b in NUMERIC_MAP if b in bw_detail.columns]
-                        st.dataframe(bw_detail[bw_show_cols] if bw_show_cols else bw_detail,
-                                     use_container_width=True, height=300)
+                        st.dataframe(bw_detail, use_container_width=True, height=300)
                         st.metric("BW CUM_VALUE Toplamı", f"{pd.to_numeric(bw_detail.get('CUM_VALUE', pd.Series(dtype=float)), errors='coerce').sum():,.4f}")
 
             # ── Export ───────────────────────────────────────────
