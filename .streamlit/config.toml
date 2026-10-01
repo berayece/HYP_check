@@ -1,0 +1,4 @@
+[server]
+# Upload limit in MB (default 200)
+maxUploadSize = 1024
+maxMessageSize = 1024
