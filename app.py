@@ -4,6 +4,7 @@ import numpy as np
 import re
 import io
 from datetime import datetime
+from pathlib import Path
 
 pd.set_option("styler.render.max_elements", 50_000_000)
 
@@ -97,16 +98,132 @@ def load_dat(file_bytes: bytes) -> pd.DataFrame:
     df = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
     return df.dropna(how="all").reset_index(drop=True)
 
+BW_EXPECTED = {"/BIC/ACCOUNTBI", "/BIC/COMPBI", "/BIC/SCNRBI", "CALYEAR", "CUM_VALUE"}
+
+# Column order of the header-less BW CSV export (ZHYP_OH02), derived by matching rows against HYP
+BW_CSV_COLUMNS = [
+    "CALYEAR", "CUM_VALUE", "MONTH", "MTD_VALUE",
+    "/BIC/ACCOUNTBI", "/BIC/COMPBI", "/BIC/CURBI", "/BIC/CURTYPE",
+    "/BIC/CUSTOM1BI", "/BIC/CUSTOM2BI", "/BIC/CUSTOM3BI", "/BIC/CUSTOM4BI",
+    "/BIC/ICPBI", "/BIC/ICPFLAG", "/BIC/SCNRBI",
+]
+
+def is_csv_name(name: str) -> bool:
+    return Path(name).suffix.lower() in (".csv", ".txt")
+
+def sniff_csv(file_bytes: bytes) -> tuple[str, str]:
+    """Return (encoding, delimiter) for a BW CSV export."""
+    head = file_bytes[:65536]
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        enc = "utf-16"
+    else:
+        try:
+            head[:-4].decode("utf-8-sig")
+            enc = "utf-8-sig"
+        except UnicodeDecodeError:
+            enc = "cp1254"
+    text = head.decode(enc, errors="ignore")
+    lines = [l for l in text.splitlines()[:3] if l.strip()] or [""]
+    sep = max([";", ",", "\t", "|"], key=lambda d: sum(l.count(d) for l in lines))
+    return enc, sep
+
+def _bw_header_row(rows: list[list[str]]) -> int:
+    """Header is on row 1 or row 2 — pick the one with more expected BW columns."""
+    hits = [len(BW_EXPECTED & {str(v).strip() for v in r}) for r in rows[:2]]
+    return 1 if len(hits) > 1 and hits[1] > hits[0] else 0
+
 @st.cache_data(show_spinner=False)
-def load_bw(file_bytes: bytes) -> pd.DataFrame:
-    bw_exp = {"/BIC/ACCOUNTBI", "/BIC/COMPBI", "/BIC/SCNRBI", "CALYEAR", "CUM_VALUE"}
-    df0 = pd.read_excel(io.BytesIO(file_bytes), dtype=str, header=0)
-    df0.columns = df0.columns.str.strip()
-    df1 = pd.read_excel(io.BytesIO(file_bytes), dtype=str, header=1)
-    df1.columns = df1.columns.str.strip()
-    df = df1 if len(bw_exp & set(df1.columns)) >= len(bw_exp & set(df0.columns)) else df0
+def load_bw(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    if is_csv_name(file_name):
+        enc, sep = sniff_csv(file_bytes)
+        peek = file_bytes[:65536].decode(enc, errors="ignore").splitlines()[:2]
+        rows = [l.split(sep) for l in peek]
+        if not any(BW_EXPECTED & {v.strip() for v in r} for r in rows) \
+                and rows and len(rows[0]) == len(BW_CSV_COLUMNS):
+            # No header row — use the known column order of the BW CSV export
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=sep, dtype=str,
+                             header=None, names=BW_CSV_COLUMNS, on_bad_lines="warn")
+        else:
+            h = _bw_header_row(rows)
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=sep, dtype=str,
+                             skiprows=h, header=0, on_bad_lines="warn")
+    else:
+        raw = pd.read_excel(io.BytesIO(file_bytes), dtype=str, header=None)
+        h = _bw_header_row(raw.head(2).fillna("").values.tolist())
+        df = raw.iloc[h + 1:].reset_index(drop=True)
+        df.columns = raw.iloc[h].fillna("").astype(str).tolist()
+    df.columns = [str(c).strip() for c in df.columns]
     df = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
     return df.dropna(how="all").reset_index(drop=True)
+
+# ──────────────────────────────────────────────
+# ZERO-ROW CLEANUP + SAVE CLEANED VERSION
+# ──────────────────────────────────────────────
+
+DEFAULT_SAVE_DIR = Path.home() / "Downloads"
+
+def drop_zero_rows(df: pd.DataFrame, value_col: str) -> tuple[pd.DataFrame, int]:
+    """Remove rows whose amount is zero or empty (compare() treats both as zero)."""
+    if value_col not in df.columns:
+        return df, 0
+    vals = pd.to_numeric(df[value_col].astype(str).str.strip(), errors="coerce")
+    keep = vals.abs() > 1e-4
+    return df[keep].reset_index(drop=True), int((~keep).sum())
+
+def _clean_path(folder: str, original_name: str, ext: str) -> Path:
+    stem = Path(original_name).stem
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = Path(folder).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    return target / f"{stem}_nozero_{ts}{ext}"
+
+def save_clean_dat(df: pd.DataFrame, file_bytes: bytes, original_name: str, folder: str) -> Path:
+    text = file_bytes.decode("utf-16")
+    first_line = text.splitlines()[0] if text else "! DATA"
+    eol = "\r\n" if "\r\n" in text[:5000] else "\n"
+    body = df[DAT_COLUMNS].to_csv(sep=";", header=False, index=False, lineterminator=eol)
+    path = _clean_path(folder, original_name, Path(original_name).suffix or ".dat")
+    path.write_bytes((first_line + eol + body).encode("utf-16"))
+    return path
+
+def save_clean_bw(df: pd.DataFrame, file_bytes: bytes, original_name: str,
+                  folder: str, fmt: str) -> Path:
+    if fmt == "csv":
+        enc, sep = sniff_csv(file_bytes) if is_csv_name(original_name) else ("utf-8-sig", ";")
+        path = _clean_path(folder, original_name, ".csv")
+        df.to_csv(path, sep=sep, index=False, encoding=enc)
+        return path
+    out = df.copy()
+    for col in ("CUM_VALUE", "MTD_VALUE"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    path = _clean_path(folder, original_name, ".xlsx")
+    out.to_excel(path, index=False, engine="openpyxl")
+    return path
+
+def pick_folder(initial: str):
+    """Open the OS folder picker (app runs locally). Returns None if cancelled/unavailable."""
+    import subprocess, sys
+    try:
+        if sys.platform == "darwin":
+            init = str(Path(initial).expanduser()) if Path(initial).expanduser().is_dir() else str(Path.home())
+            script = (f'POSIX path of (choose folder with prompt "Sıfırsız dosya nereye kaydedilsin?" '
+                      f'default location POSIX file "{init}")')
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=600)
+        elif sys.platform.startswith("win"):
+            ps = ("Add-Type -AssemblyName System.Windows.Forms;"
+                  "$d=New-Object System.Windows.Forms.FolderBrowserDialog;"
+                  "$d.Description='Sifirsiz dosya nereye kaydedilsin?';"
+                  f"$d.SelectedPath='{initial}';"
+                  "$f=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
+                  "if($d.ShowDialog($f) -eq 'OK'){$d.SelectedPath}")
+            r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                               capture_output=True, text=True, timeout=600)
+        else:
+            return None
+        return r.stdout.strip() or None
+    except Exception:
+        return None
 
 # ──────────────────────────────────────────────
 # COMPARISON
@@ -126,7 +243,7 @@ def compare(hyp: pd.DataFrame, bw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     }
 
     if missing_hyp or missing_bw:
-        return pd.DataFrame(), diag
+        return pd.DataFrame(), diag, hyp, bw
 
     hyp_c = normalise(hyp, hyp_keys)
     bw_c  = normalise(bw,  bw_keys)
@@ -228,31 +345,83 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 st.title("🔍 HYP vs BW Comparison Tool")
 
+def _on_pick(dir_key: str):
+    chosen = pick_folder(st.session_state.get(dir_key) or str(DEFAULT_SAVE_DIR))
+    if chosen:
+        st.session_state[dir_key] = chosen
+
+def save_prompt(kind: str, f, df: pd.DataFrame, removed: int):
+    """Ask where to save the zero-free version right after a file is read."""
+    states = st.session_state.setdefault("clean_saved", {})
+    file_key = f"{kind}|{f.name}|{f.size}"
+    state = states.get(file_key)
+    if not removed:
+        return
+    if state and state.startswith("saved:"):
+        st.caption(f"💾 Sıfırsız versiyon kaydedildi: `{state[6:]}`")
+        return
+    if state == "skipped":
+        st.caption("Sıfırsız versiyon kaydedilmedi.")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"**{removed:,} sıfır satır silindi.** Sıfırsız versiyonu nereye kaydedeyim?")
+        dir_key = f"save_dir_{kind}"
+        if dir_key not in st.session_state:
+            st.session_state[dir_key] = st.session_state.get("last_save_dir", str(DEFAULT_SAVE_DIR))
+        st.text_input("Klasör", key=dir_key)
+        fmt = None
+        if kind == "BW":
+            fmt_opts = ["xlsx", "csv"]
+            fmt = st.radio("Format", fmt_opts, horizontal=True, key=f"save_fmt_{kind}",
+                           index=1 if is_csv_name(f.name) else 0,
+                           help="Büyük dosyalarda CSV çok daha hızlı yazılır.")
+        b1, b2, b3 = st.columns(3)
+        b1.button("📁 Klasör seç…", key=f"pick_{kind}", on_click=_on_pick, args=(dir_key,),
+                  use_container_width=True)
+        do_save = b2.button("💾 Kaydet", key=f"save_{kind}", type="primary", use_container_width=True)
+        if b3.button("Kaydetme", key=f"skip_{kind}", use_container_width=True):
+            states[file_key] = "skipped"
+            st.rerun()
+        if do_save:
+            folder = st.session_state[dir_key].strip() or str(DEFAULT_SAVE_DIR)
+            with st.spinner(f"Sıfırsız {kind} versiyonu kaydediliyor…"):
+                try:
+                    path = save_clean_dat(df, f.getvalue(), f.name, folder) if kind == "HYP" \
+                           else save_clean_bw(df, f.getvalue(), f.name, folder, fmt)
+                except Exception as e:
+                    st.error(f"Kaydedilemedi: {e}")
+                    return
+            states[file_key] = f"saved:{path}"
+            st.session_state["last_save_dir"] = folder
+            st.rerun()
+
+hyp_df = bw_df = None
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("📂 Hyperion .dat file")
     dat_file = st.file_uploader("Upload .dat file", type=["dat", "txt", "csv"], key="dat")
-
-with col2:
-    st.subheader("📊 BW Excel backup file")
-    bw_file = st.file_uploader("Upload BW Excel file", type=["xlsx", "xls"], key="bw")
-
-if dat_file and bw_file:
-    with st.spinner("Loading files…"):
-        hyp_df = load_dat(dat_file.read())
-        bw_df  = load_bw(bw_file.read())
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.success(f"✅ HYP loaded — {len(hyp_df):,} rows")
+    if dat_file:
+        with st.spinner("HYP okunuyor…"):
+            hyp_df, hyp_zero = drop_zero_rows(load_dat(dat_file.getvalue()), "Amount")
+        st.success(f"✅ HYP loaded — {len(hyp_df):,} rows ({hyp_zero:,} sıfır satır silindi)")
+        save_prompt("HYP", dat_file, hyp_df, hyp_zero)
         with st.expander("Preview HYP data"):
             st.dataframe(hyp_df.head(10), use_container_width=True)
-    with col2:
-        st.success(f"✅ BW loaded — {len(bw_df):,} rows")
+
+with col2:
+    st.subheader("📊 BW backup file (Excel / CSV)")
+    bw_file = st.file_uploader("Upload BW Excel or CSV file", type=["xlsx", "xls", "csv"], key="bw")
+    if bw_file:
+        with st.spinner("BW okunuyor…"):
+            bw_df, bw_zero = drop_zero_rows(load_bw(bw_file.getvalue(), bw_file.name), "CUM_VALUE")
+        st.success(f"✅ BW loaded — {len(bw_df):,} rows ({bw_zero:,} sıfır satır silindi)")
+        save_prompt("BW", bw_file, bw_df, bw_zero)
         with st.expander("Preview BW data"):
             st.dataframe(bw_df.head(10), use_container_width=True)
 
+if hyp_df is not None and bw_df is not None:
     bw_df_filtered = bw_df
     curtype_col = "/BIC/CURTYPE"
     if curtype_col in bw_df.columns:
