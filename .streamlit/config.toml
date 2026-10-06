@@ -1,4 +1,4 @@
 [server]
 # Upload limit in MB (default 200)
-maxUploadSize = 1024
+maxUploadSize = 5120
 maxMessageSize = 1024
