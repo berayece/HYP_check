@@ -6,7 +6,8 @@ A web-based tool to compare Hyperion `.dat` exports against SAP BW Excel backups
 
 ## Features
 
-- Upload Hyperion `.dat` file and BW Excel file directly in the browser
+- Upload Hyperion `.dat` file and BW Excel/CSV file in the browser, or read them straight from disk
+  (**Diskten oku** — recommended for files over ~500 MB; avoids browser-upload memory copies)
 - Auto-detects encoding (UTF-16), delimiter, and header rows
 - Normalises period names (Jan → 1), ICP None variants, and case differences before matching
 - Compares absolute values — opposite signs with equal amounts count as matching

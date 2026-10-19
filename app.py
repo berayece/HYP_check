@@ -104,15 +104,45 @@ def normalise(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 # FILE LOADERS
 # ──────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
+CHUNK_ROWS = 500_000   # rows per chunk — keeps peak memory low on multi-GB files
+
+def _strip(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim text columns (object or pandas string dtype)."""
+    return df.apply(lambda c: c.str.strip() if (c.dtype == object or pd.api.types.is_string_dtype(c)) else c)
+
+def _peek(src, n: int = 65536) -> bytes:
+    """First n bytes of a path or file-like object, leaving the stream at the start."""
+    if isinstance(src, (str, Path)):
+        with open(src, "rb") as fh:
+            return fh.read(n)
+    src.seek(0)
+    head = src.read(n)
+    src.seek(0)
+    return head
+
+def _read_chunked(value_col: str, reader) -> tuple[pd.DataFrame, int]:
+    """Concat chunks from a chunked read_csv, dropping zero-amount rows as they stream in."""
+    parts, zeros = [], 0
+    for ch in reader:
+        ch = _strip(ch).dropna(how="all")
+        ch, z = drop_zero_rows(ch, value_col)
+        zeros += z
+        parts.append(ch)
+    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return df, zeros
+
+def read_dat(src) -> tuple[pd.DataFrame, int]:
+    """Hyperion .dat (path or file-like) → (zero-free frame, removed zero rows)."""
+    df, zeros = _read_chunked("Amount", pd.read_csv(
+        src, encoding="utf-16", sep=";", skiprows=1, header=None, names=DAT_COLUMNS,
+        dtype=str, on_bad_lines="warn", chunksize=CHUNK_ROWS))
+    if df.empty:
+        df = pd.DataFrame(columns=DAT_COLUMNS, dtype=str)
+    return df, zeros
+
 def load_dat(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(
-        io.BytesIO(file_bytes),
-        encoding="utf-16", sep=";", skiprows=1,
-        header=None, names=DAT_COLUMNS, dtype=str, on_bad_lines="warn",
-    )
-    df = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
-    return df.dropna(how="all").reset_index(drop=True)
+    """Kept for scripts/tests: bytes in, zero-free frame out."""
+    return read_dat(io.BytesIO(file_bytes))[0]
 
 BW_EXPECTED = {"/BIC/ACCOUNTBI", "/BIC/COMPBI", "/BIC/SCNRBI", "CALYEAR", "CUM_VALUE"}
 
@@ -148,29 +178,57 @@ def _bw_header_row(rows: list[list[str]]) -> int:
     hits = [len(BW_EXPECTED & {str(v).strip() for v in r}) for r in rows[:2]]
     return 1 if len(hits) > 1 and hits[1] > hits[0] else 0
 
-@st.cache_data(show_spinner=False)
-def load_bw(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+def read_bw(src, file_name: str) -> tuple[pd.DataFrame, int]:
+    """BW Excel/CSV (path or file-like) → (zero-free frame, removed zero rows)."""
     if is_csv_name(file_name):
-        enc, sep = sniff_csv(file_bytes)
-        peek = file_bytes[:65536].decode(enc, errors="ignore").splitlines()[:2]
-        rows = [l.split(sep) for l in peek]
+        head = _peek(src)
+        enc, sep = sniff_csv(head)
+        rows = [l.split(sep) for l in head.decode(enc, errors="ignore").splitlines()[:2]]
         if not any(BW_EXPECTED & {v.strip() for v in r} for r in rows) \
                 and rows and len(rows[0]) == len(BW_CSV_COLUMNS):
             # No header row — use the known column order of the BW CSV export
-            df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=sep, dtype=str,
-                             header=None, names=BW_CSV_COLUMNS, on_bad_lines="warn")
+            opts = dict(header=None, names=BW_CSV_COLUMNS)
         else:
-            h = _bw_header_row(rows)
-            df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=sep, dtype=str,
-                             skiprows=h, header=0, on_bad_lines="warn")
+            opts = dict(skiprows=_bw_header_row(rows), header=0)
+        reader = pd.read_csv(src, encoding=enc, sep=sep, dtype=str, on_bad_lines="warn",
+                             chunksize=CHUNK_ROWS, **opts)
+        parts = []
+        for ch in reader:
+            ch.columns = [str(c).strip() for c in ch.columns]
+            parts.append(ch)
+        df, zeros = _read_chunked("CUM_VALUE", parts)
     else:
-        raw = pd.read_excel(io.BytesIO(file_bytes), dtype=str, header=None)
+        raw = pd.read_excel(src, dtype=str, header=None)
         h = _bw_header_row(raw.head(2).fillna("").values.tolist())
         df = raw.iloc[h + 1:].reset_index(drop=True)
-        df.columns = raw.iloc[h].fillna("").astype(str).tolist()
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.apply(lambda c: c.str.strip() if c.dtype == object else c)
-    return df.dropna(how="all").reset_index(drop=True)
+        df.columns = [str(c).strip() for c in raw.iloc[h].fillna("").astype(str).tolist()]
+        del raw
+        df, zeros = _read_chunked("CUM_VALUE", [df])
+    return df.reset_index(drop=True), zeros
+
+def load_bw(file_bytes: bytes, file_name: str) -> pd.DataFrame:
+    """Kept for scripts/tests: bytes in, zero-free frame out."""
+    return read_bw(io.BytesIO(file_bytes), file_name)[0]
+
+class LocalFile:
+    """A file read straight from disk — same attributes the app uses from an UploadedFile."""
+    def __init__(self, path: str):
+        p = Path(path).expanduser()
+        st_ = p.stat()
+        self.path, self.name, self.size, self.mtime = str(p), p.name, st_.st_size, st_.st_mtime
+
+def file_head(f, n: int = 65536) -> bytes:
+    return _peek(f.path if isinstance(f, LocalFile) else f, n)
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _load_cached(kind: str, ident: tuple, _src, name: str):
+    # cache_resource keeps one shared copy (no per-rerun pickling); _src is not hashed — ident is the key
+    return read_dat(_src) if kind == "HYP" else read_bw(_src, name)
+
+def load_source(kind: str, f) -> tuple[pd.DataFrame, int]:
+    if isinstance(f, LocalFile):
+        return _load_cached(kind, ("disk", f.path, f.size, f.mtime), f.path, f.name)
+    return _load_cached(kind, ("upload", f.file_id, f.name, f.size), f, f.name)
 
 # ──────────────────────────────────────────────
 # ZERO-ROW CLEANUP + SAVE CLEANED VERSION
@@ -193,8 +251,8 @@ def _clean_path(folder: str, original_name: str, ext: str) -> Path:
     target.mkdir(parents=True, exist_ok=True)
     return target / f"{stem}_nozero_{ts}{ext}"
 
-def save_clean_dat(df: pd.DataFrame, file_bytes: bytes, original_name: str, folder: str) -> Path:
-    text = file_bytes.decode("utf-16")
+def save_clean_dat(df: pd.DataFrame, head: bytes, original_name: str, folder: str) -> Path:
+    text = head.decode("utf-16", errors="ignore")
     first_line = text.splitlines()[0] if text else "! DATA"
     eol = "\r\n" if "\r\n" in text[:5000] else "\n"
     body = df[DAT_COLUMNS].to_csv(sep=";", header=False, index=False, lineterminator=eol)
@@ -202,10 +260,10 @@ def save_clean_dat(df: pd.DataFrame, file_bytes: bytes, original_name: str, fold
     path.write_bytes((first_line + eol + body).encode("utf-16"))
     return path
 
-def save_clean_bw(df: pd.DataFrame, file_bytes: bytes, original_name: str,
+def save_clean_bw(df: pd.DataFrame, head: bytes, original_name: str,
                   folder: str, fmt: str) -> Path:
     if fmt == "csv":
-        enc, sep = sniff_csv(file_bytes) if is_csv_name(original_name) else ("utf-8-sig", ";")
+        enc, sep = sniff_csv(head) if is_csv_name(original_name) else ("utf-8-sig", ";")
         path = _clean_path(folder, original_name, ".csv")
         df.to_csv(path, sep=sep, index=False, encoding=enc)
         return path
@@ -216,6 +274,32 @@ def save_clean_bw(df: pd.DataFrame, file_bytes: bytes, original_name: str,
     path = _clean_path(folder, original_name, ".xlsx")
     out.to_excel(path, index=False, engine="openpyxl")
     return path
+
+def pick_file(initial: str, exts: list):
+    """Open the OS file picker (app runs locally). Returns a path or None."""
+    import subprocess, sys
+    try:
+        start = Path(initial).expanduser()
+        start = start if start.is_dir() else (start.parent if start.parent.is_dir() else Path.home())
+        if sys.platform == "darwin":
+            script = (f'POSIX path of (choose file with prompt "Dosya seçin" '
+                      f'default location POSIX file "{start}")')
+            r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=600)
+        elif sys.platform.startswith("win"):
+            flt = ";".join(f"*.{e}" for e in exts)
+            ps = ("Add-Type -AssemblyName System.Windows.Forms;"
+                  "$d=New-Object System.Windows.Forms.OpenFileDialog;"
+                  f"$d.Filter='Veri dosyalari ({flt})|{flt}|Tum dosyalar (*.*)|*.*';"
+                  f"$d.InitialDirectory='{start}';"
+                  "$f=New-Object System.Windows.Forms.Form -Property @{TopMost=$true};"
+                  "if($d.ShowDialog($f) -eq 'OK'){$d.FileName}")
+            r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                               capture_output=True, text=True, timeout=600)
+        else:
+            return None
+        return r.stdout.strip() or None
+    except Exception:
+        return None
 
 def pick_folder(initial: str):
     """Open the OS folder picker (app runs locally). Returns None if cancelled/unavailable."""
@@ -832,8 +916,8 @@ def save_prompt(kind: str, f, df: pd.DataFrame, removed: int):
             folder = st.session_state[dir_key].strip() or str(DEFAULT_SAVE_DIR)
             with st.spinner(f"Sıfırsız {kind} versiyonu kaydediliyor…"):
                 try:
-                    path = save_clean_dat(df, f.getvalue(), f.name, folder) if kind == "HYP" \
-                           else save_clean_bw(df, f.getvalue(), f.name, folder, fmt)
+                    path = save_clean_dat(df, file_head(f), f.name, folder) if kind == "HYP" \
+                           else save_clean_bw(df, file_head(f), f.name, folder, fmt)
                 except Exception as e:
                     st.error(f"Kaydedilemedi: {e}")
                     return
@@ -841,15 +925,45 @@ def save_prompt(kind: str, f, df: pd.DataFrame, removed: int):
             st.session_state["last_save_dir"] = folder
             st.rerun()
 
+def _on_pick_file(path_key: str, exts: list):
+    chosen = pick_file(st.session_state.get(path_key) or str(DEFAULT_SAVE_DIR), exts)
+    if chosen:
+        st.session_state[path_key] = chosen
+
+SRC_UPLOAD, SRC_DISK = "Tarayıcıdan yükle", "Diskten oku (büyük dosyalar)"
+
+def source_input(kind: str, upload_label: str, exts: list):
+    """Upload widget or a disk path — disk avoids Streamlit's in-memory copies of large uploads."""
+    mode = st.radio("Kaynak", [SRC_UPLOAD, SRC_DISK], horizontal=True, key=f"src_{kind}",
+                    label_visibility="collapsed",
+                    help="Tarayıcıdan yüklenen dosya bellekte birkaç kez kopyalanır. "
+                         "500 MB üzeri dosyalarda 'Diskten oku' seçin.")
+    if mode == SRC_UPLOAD:
+        return st.file_uploader(upload_label, type=exts, key="dat" if kind == "HYP" else "bw")
+    path_key = f"path_{kind}"
+    c1, c2 = st.columns([5, 1], vertical_alignment="bottom")
+    c1.text_input("Dosya yolu", key=path_key, placeholder=r"örn. D:\Veri\dosya." + exts[0])
+    c2.button("📁 Seç…", key=f"pickf_{kind}", on_click=_on_pick_file, args=(path_key, exts),
+              use_container_width=True)
+    raw = (st.session_state.get(path_key) or "").strip().strip('"')
+    if not raw:
+        return None
+    if not Path(raw).expanduser().is_file():
+        st.error(f"Dosya bulunamadı: `{raw}`")
+        return None
+    if Path(raw).suffix.lower().lstrip(".") not in exts:
+        st.warning(f"Beklenen uzantılar: {', '.join(exts)} — yine de okunmaya çalışılacak.")
+    return LocalFile(raw)
+
 hyp_df = bw_df = None
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("📂 Hyperion .dat file")
-    dat_file = st.file_uploader("Upload .dat file", type=["dat", "txt", "csv"], key="dat")
+    dat_file = source_input("HYP", "Upload .dat file", ["dat", "txt", "csv"])
     if dat_file:
         with st.spinner("HYP okunuyor…"):
-            hyp_df, hyp_zero = drop_zero_rows(load_dat(dat_file.getvalue()), "Amount")
+            hyp_df, hyp_zero = load_source("HYP", dat_file)
         st.success(f"✅ HYP loaded — {len(hyp_df):,} rows ({hyp_zero:,} sıfır satır silindi)")
         save_prompt("HYP", dat_file, hyp_df, hyp_zero)
         with st.expander("Preview HYP data"):
@@ -857,10 +971,10 @@ with col1:
 
 with col2:
     st.subheader("📊 BW backup file (Excel / CSV)")
-    bw_file = st.file_uploader("Upload BW Excel or CSV file", type=["xlsx", "xls", "csv"], key="bw")
+    bw_file = source_input("BW", "Upload BW Excel or CSV file", ["xlsx", "xls", "csv"])
     if bw_file:
         with st.spinner("BW okunuyor…"):
-            bw_df, bw_zero = drop_zero_rows(load_bw(bw_file.getvalue(), bw_file.name), "CUM_VALUE")
+            bw_df, bw_zero = load_source("BW", bw_file)
         st.success(f"✅ BW loaded — {len(bw_df):,} rows ({bw_zero:,} sıfır satır silindi)")
         save_prompt("BW", bw_file, bw_df, bw_zero)
         with st.expander("Preview BW data"):
