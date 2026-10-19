@@ -259,7 +259,10 @@ def compare(hyp: pd.DataFrame, bw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     }
 
     if missing_hyp or missing_bw:
-        return pd.DataFrame(), diag, hyp, bw
+        # Return frames with HYP-style column names so downstream stats/drill-down still work
+        bw_ren = bw.rename(columns={b: h for h, b in JOIN_KEYS}).rename(
+            columns={b: f"{h}_BW" for h, b in NUMERIC_MAP})
+        return pd.DataFrame(), diag, hyp, bw_ren
 
     hyp_c = normalise(hyp, hyp_keys)
     bw_c  = normalise(bw,  bw_keys)
@@ -380,11 +383,15 @@ def _period_label(periods) -> str:
 
 def run_stats(hyp_norm: pd.DataFrame, bw_norm: pd.DataFrame) -> dict:
     """Scope + amount control figures of the compared data (after all filters)."""
-    h = hyp_norm.assign(_amt=pd.to_numeric(hyp_norm.get("Amount"), errors="coerce"))
-    b = bw_norm.assign(_amt=pd.to_numeric(bw_norm.get("Amount_BW"), errors="coerce"))
+    dims = [h for h, _ in JOIN_KEYS]
+    # Missing columns (e.g. an empty or incomplete file) become empty — never a KeyError
+    h = hyp_norm.reindex(columns=list(dict.fromkeys(list(hyp_norm.columns) + dims + ["Amount"])))
+    b = bw_norm.reindex(columns=list(dict.fromkeys(list(bw_norm.columns) + dims + ["Amount_BW"])))
+    h = h.assign(_amt=pd.to_numeric(h["Amount"], errors="coerce"))
+    b = b.assign(_amt=pd.to_numeric(b["Amount_BW"], errors="coerce"))
 
     def _vals(col):
-        return sorted(set(h[col].dropna().astype(str)) | set(b[col].dropna().astype(str))) if col in h and col in b else []
+        return sorted(set(h[col].dropna().astype(str)) | set(b[col].dropna().astype(str)))
 
     def _per(dim):
         g = pd.DataFrame({
@@ -452,7 +459,16 @@ def _write_report_sheet(wb, full: pd.DataFrame, diag: dict, stats: dict, meta: d
     diffs = sm["total"] - sm[IDENTICAL]
     ws.merge_cells("A4:H4")
     ws.row_dimensions[4].height = 34
-    if diffs == 0:
+    missing = (diag.get("missing_hyp") or []) + (diag.get("missing_bw") or [])
+    if missing:
+        ws["A4"] = f"❌  KARŞILAŞTIRMA YAPILAMADI — eksik anahtar sütun(lar): {', '.join(missing)}"
+        ws["A4"].fill, ws["A4"].font = fill("FBE3E3"), Font(bold=True, size=13, color="9B1C1C")
+    elif meta.get("single_source"):
+        other = "BW" if meta["single_source"] == "HYP" else "HYP"
+        ws["A4"] = (f"ℹ️  TEK KAYNAK — yalnızca {meta['single_source']} verisi yüklendi, {other} yok; "
+                    f"{_tr_int(diffs)} satırın tamamı 'Sadece {meta['single_source']}'")
+        ws["A4"].fill, ws["A4"].font = fill("E6EEF8"), Font(bold=True, size=13, color="1B4F8A")
+    elif diffs == 0:
         ws["A4"] = "✅  FARK BULUNMADI — HYP ve BW verileri mutabık (mutlak değerle karşılaştırma)"
         ws["A4"].fill, ws["A4"].font = fill("E3F4EC"), Font(bold=True, size=13, color="0E6B47")
     else:
@@ -562,6 +578,9 @@ def _write_report_sheet(wb, full: pd.DataFrame, diag: dict, stats: dict, meta: d
         "Eşleştirme anahtarı: Senaryo, Yıl, Dönem, Entity, Hesap, ICP, Custom1–4.",
         "Tolerans: 0,0001 (çok büyük tutarlarda göreli 10⁻¹²).",
     ]
+    if meta.get("single_source"):
+        notes.insert(0, f"Tek kaynak modu: yalnızca {meta['single_source']} dosyası yüklendi; "
+                        "karşı taraf boş kabul edildi, bu bir mutabakat değil, tek taraflı dökümdür.")
     if meta.get("curtype_selected") is not None:
         notes.append(f"BW CURTYPE dahil edilen değerler: {', '.join(meta['curtype_selected']) or '—'}.")
     if diag.get("param_accounts"):
@@ -847,6 +866,19 @@ with col2:
         with st.expander("Preview BW data"):
             st.dataframe(bw_df.head(10), use_container_width=True)
 
+# Single-source mode: the missing side is an empty frame with the expected columns,
+# so every row of the uploaded file is reported as "only in" that source.
+single_source = None
+if (hyp_df is None) != (bw_df is None):
+    if hyp_df is None:
+        single_source, hyp_df, hyp_zero = "BW", pd.DataFrame(columns=DAT_COLUMNS, dtype=str), 0
+    else:
+        single_source, hyp_zero = "HYP", hyp_zero
+        bw_df, bw_zero = pd.DataFrame(columns=[b for _, b in JOIN_KEYS] + [b for _, b in NUMERIC_MAP], dtype=str), 0
+    missing = "BW" if single_source == "HYP" else "HYP"
+    st.warning(f"⚠️ Tek kaynak modu: {missing} dosyası yüklenmedi. Karşılaştırma yine çalışır; "
+               f"{single_source} dosyasındaki tüm satırlar **Sadece {single_source}** olarak raporlanır.")
+
 if hyp_df is not None and bw_df is not None:
     bw_df_filtered = bw_df
     curtype_col = "/BIC/CURTYPE"
@@ -917,7 +949,9 @@ if hyp_df is not None and bw_df is not None:
                 result = result[~is_param].reset_index(drop=True)
             g = globals()
             meta = {
-                "run_at": datetime.now(), "hyp_file": dat_file.name, "bw_file": bw_file.name,
+                "run_at": datetime.now(), "single_source": single_source,
+                "hyp_file": dat_file.name if dat_file else "— (yüklenmedi)",
+                "bw_file": bw_file.name if bw_file else "— (yüklenmedi)",
                 "hyp_loaded": len(hyp_df) + hyp_zero, "hyp_zero": hyp_zero,
                 "bw_loaded": len(bw_df) + bw_zero, "bw_zero": bw_zero,
                 "curtype_excluded": g.get("excluded"), "curtype_selected": g.get("selected_curtypes"),
@@ -938,6 +972,15 @@ if hyp_df is not None and bw_df is not None:
         result = st.session_state["result"]
         diag   = st.session_state["diag"]
 
+        if diag.get("missing_hyp") or diag.get("missing_bw"):
+            st.error("❌ Karşılaştırma yapılamadı — anahtar sütunlar eksik. "
+                     + (f"HYP: {', '.join(diag['missing_hyp'])}. " if diag.get("missing_hyp") else "")
+                     + (f"BW: {', '.join(diag['missing_bw'])}." if diag.get("missing_bw") else "")
+                     + " Dosya formatını / başlık satırını kontrol edin.")
+        src = (st.session_state.get("run_meta") or {}).get("single_source")
+        if src:
+            st.warning(f"Bu sonuç tek kaynakla üretildi: yalnızca {src} verisi var, "
+                       f"{'BW' if src == 'HYP' else 'HYP'} tarafı boş kabul edildi.")
         render_report(result, diag, st.session_state.get("run_stats"))
 
         with st.expander("🔬 Teknik detay — anahtar sütun eşleşmeleri"):
@@ -1174,4 +1217,4 @@ if hyp_df is not None and bw_df is not None:
             )
 
 else:
-    st.info("👆 Upload both files above to start the comparison.")
+    st.info("👆 Karşılaştırma için en az bir dosya yükleyin (HYP ve/veya BW).")
